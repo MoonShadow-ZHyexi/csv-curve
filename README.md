@@ -1,5 +1,7 @@
 # CSV 数据曲线
 
+[English](./README.en.md)
+
 Windows 上的 CSV 绘图与 PWM 占空比转换工具，使用 C++ 编写。支持拖入 CSV、选择坐标列、缩放和平移、十字线读数，以及导出 JPG 和转换后的 CSV。
 
 ## 下载和运行
