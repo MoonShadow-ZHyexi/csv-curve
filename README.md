@@ -4,12 +4,12 @@ Windows 上的 CSV 绘图与 PWM 占空比转换工具，使用 C++ 编写。支
 
 ## 下载和运行
 
-在 GitHub 打开对应的 EXE 文件，再点击 **Download raw file** 下载。根据 Windows 的系统位数选择版本。
+从 [GitHub Releases](https://github.com/MoonShadow-ZHyexi/csv-curve/releases/latest) 下载。根据 Windows 的系统位数选择版本。
 
 | Windows 系统 | 下载 |
 | --- | --- |
-| 32 位 | [csv_curve_x86.exe](./csv_curve_x86.exe) |
-| 64 位 | [csv_curve.exe](./csv_curve.exe) |
+| 32 位（x86） | [csv_curve_x86.exe](https://github.com/MoonShadow-ZHyexi/csv-curve/releases/latest/download/csv_curve_x86.exe) |
+| 64 位（x64） | [csv_curve.exe](https://github.com/MoonShadow-ZHyexi/csv-curve/releases/latest/download/csv_curve.exe) |
 
 双击 EXE 即可运行，无需安装 Python。两个版本均面向 Windows 7 构建，包含程序图标。若旧版在 Windows 7 上报 `GetDpiForSystem` 入口错误，请用这里的新版 EXE 替换。
 
