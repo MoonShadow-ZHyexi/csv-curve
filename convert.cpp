@@ -1,8 +1,9 @@
+#include "convert.h"
+#include "csv.h"
+
 #include <algorithm>
 #include <charconv>
 #include <cmath>
-#include <cstdlib>
-#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -22,6 +23,7 @@
 namespace {
 namespace fs = std::filesystem;
 
+#ifndef PWM_CONVERTER_LIBRARY
 void print(const std::string& message)
 {
 #ifdef _WIN32
@@ -64,91 +66,12 @@ std::string read_filename()
     return filename.substr(start, filename.find_last_not_of(" \t\r\n\v\f") - start + 1);
 }
 
-// Read one CSV record, preserving commas and newlines inside quoted fields.
-bool read_record(std::streambuf& input, std::vector<std::string>& fields)
-{
-    using Traits = std::char_traits<char>;
-    std::size_t column = 0;
-    bool quoted = false;
-    bool at_field_start = true;
-    bool blank = true;
-    if (fields.empty()) {
-        fields.emplace_back();
-    }
-    fields.front().clear();
-
-    for (int value; (value = input.sbumpc()) != Traits::eof();) {
-        const char ch = Traits::to_char_type(value);
-        if (quoted) {
-            if (ch != '"') {
-                fields[column].push_back(ch);
-            } else if (input.sgetc() == '"') {
-                input.sbumpc();
-                fields[column].push_back('"');
-            } else {
-                quoted = false;
-            }
-        } else if (ch == '\r' || ch == '\n') {
-            if (ch == '\r' && input.sgetc() == '\n') {
-                input.sbumpc();
-            }
-            if (!blank) {
-                break;
-            }
-            fields.front().clear();
-            at_field_start = true;
-        } else if (ch == ',') {
-            ++column;
-            if (column == fields.size()) {
-                fields.emplace_back();
-            } else {
-                fields[column].clear();
-            }
-            at_field_start = true;
-            blank = false;
-        } else {
-            if (ch == '"' && at_field_start) {
-                quoted = true;
-            } else {
-                fields[column].push_back(ch);
-            }
-            at_field_start = false;
-            blank = blank && (ch == ' ' || ch == '\t');
-        }
-    }
-    if (quoted) {
-        throw std::runtime_error("CSV 中的引号未闭合。");
-    }
-    fields.resize(column + 1);
-    return !blank;
-}
-
-bool is_missing(std::string_view field)
-{
-    constexpr std::string_view markers[] = {
-        "", "#N/A", "#N/A N/A", "#NA", "-1.#IND", "-1.#QNAN", "-NaN", "-nan",
-        "1.#IND", "1.#QNAN", "<NA>", "N/A", "NA", "NULL", "NaN", "None",
-        "n/a", "nan", "null",
-    };
-    return std::find(std::begin(markers), std::end(markers), field) != std::end(markers);
-}
-
-bool parse_number(const std::string& field, double& number)
-{
-    const char* start = field.c_str();
-    char* end = nullptr;
-    number = std::strtod(start, &end);
-    if (end == start) {
-        return false;
-    }
-    end += std::strspn(end, " \t\r\n\v\f");
-    return end == start + field.size();
-}
+#endif
 
 double number_from(const std::string& field, const char* column, std::size_t row)
 {
     double number = 0.0;
-    if (!parse_number(field, number)) {
+    if (!csv::parse_number(field, number)) {
         throw std::runtime_error("第 " + std::to_string(row) +
                                  " 条数据的 " + column + " 无法转成数字。");
     }
@@ -199,7 +122,9 @@ std::string format_number(double value)
     return text;
 }
 
-std::string output_filename_for(std::string filename)
+} // namespace
+
+std::string pwm_output_filename(std::string filename)
 {
     for (std::size_t position = 0;
          (position = filename.find(".csv", position)) != std::string::npos;
@@ -209,26 +134,24 @@ std::string output_filename_for(std::string filename)
     return filename;
 }
 
-int convert(const std::string& filename)
+PwmConversion convert_pwm(const std::string& filename, int time_decimals,
+                          const std::atomic_bool* cancel)
 {
+    if (time_decimals < 0 || time_decimals > 9) {
+        throw std::invalid_argument("时间小数位须在 0 到 9 之间。");
+    }
+    const double scale = std::pow(10.0, time_decimals);
     std::ifstream input(fs::u8path(filename), std::ios::binary);
     if (!input) {
         if (fs::exists(fs::u8path(filename))) {
             throw std::runtime_error("无法读取文件 '" + filename + "'。");
         }
-        print("❌ 文件 '" + filename + "' 未找到，请检查路径和文件名。\n");
-        return 1;
+        throw std::runtime_error("文件 '" + filename + "' 未找到，请检查路径和文件名。");
     }
 
-    // pandas accepts a UTF-8 BOM before the header.
-    char prefix[3];
-    if (!input.read(prefix, sizeof(prefix)) ||
-        std::string_view(prefix, sizeof(prefix)) != "\xef\xbb\xbf") {
-        input.clear();
-        input.seekg(0);
-    }
+    csv::skip_bom(input);
     std::vector<std::string> fields;
-    if (!read_record(*input.rdbuf(), fields)) {
+    if (!csv::read_record(*input.rdbuf(), fields)) {
         throw std::runtime_error("CSV 文件中没有表头。");
     }
     const auto time = std::find(fields.begin(), fields.end(), "Time[ns]");
@@ -244,8 +167,11 @@ int convert(const std::string& filename)
     std::size_t rows = 0;
     std::size_t index_columns = 0;
     bool duty_is_text = false;
-    while (read_record(*input.rdbuf(), fields)) {
+    while (csv::read_record(*input.rdbuf(), fields)) {
         ++rows;
+        if (cancel && rows % 4096 == 0 && cancel->load(std::memory_order_relaxed)) {
+            return {};
+        }
         if (rows == 1 && fields.size() > header_width) {
             index_columns = fields.size() - header_width;
         }
@@ -257,14 +183,14 @@ int convert(const std::string& filename)
         auto& duty_text = fields[duty_column + index_columns];
 
         double seconds = std::numeric_limits<double>::quiet_NaN();
-        if (!is_missing(timestamp)) {
+        if (!csv::is_missing(timestamp)) {
             seconds = number_from(timestamp, "Time[ns]", rows) / 1e9;
-            seconds = std::nearbyint(seconds * 10.0) / 10.0;
+            seconds = std::nearbyint(seconds * scale) / scale;
         }
 
         double duty_value = std::numeric_limits<double>::quiet_NaN();
-        if (!is_missing(duty_text)) {
-            duty_is_text = duty_is_text || !parse_number(duty_text, duty_value);
+        if (!csv::is_missing(duty_text)) {
+            duty_is_text = duty_is_text || !csv::parse_number(duty_text, duty_value);
             duty_text.erase(std::remove(duty_text.begin(), duty_text.end(), '%'), duty_text.end());
             duty_value = number_from(duty_text, "PWM: Duty cycle", rows);
         }
@@ -277,7 +203,10 @@ int convert(const std::string& filename)
     }
     input.close();
 
-    const std::string output_filename = output_filename_for(filename);
+    if (cancel && cancel->load(std::memory_order_relaxed)) {
+        return {};
+    }
+    const std::string output_filename = pwm_output_filename(filename);
     std::ofstream output(fs::u8path(output_filename));
     if (!output) {
         throw std::runtime_error("无法创建输出文件 '" + output_filename + "'。");
@@ -297,13 +226,11 @@ int convert(const std::string& filename)
         throw std::runtime_error("写入输出文件失败 '" + output_filename + "'。");
     }
 
-    print("✅ 转换完成！输出文件：" + output_filename + "\n");
-    print("原数据行数: " + std::to_string(rows) + " 行\n");
-    // Keep the original message. The calculation above uses one decimal place.
-    print("按0.01秒聚合后行数: " + std::to_string(groups.size()) + " 行\n");
-    return 0;
+    return {output_filename, rows, groups.size()};
 }
 
+#ifndef PWM_CONVERTER_LIBRARY
+namespace {
 int run(std::string filename, bool has_argument)
 {
     if (!has_argument) {
@@ -314,7 +241,12 @@ int run(std::string filename, bool has_argument)
         }
     }
     try {
-        return convert(filename);
+        const auto result = convert_pwm(filename);
+        print("✅ 转换完成！输出文件：" + result.output_filename + "\n");
+        print("原数据行数: " + std::to_string(result.rows) + " 行\n");
+        // Preserve the original command-line message and its actual 0.1 s grouping.
+        print("按0.01秒聚合后行数: " + std::to_string(result.groups) + " 行\n");
+        return 0;
     } catch (const std::exception& error) {
         print(std::string("❌ ") + error.what() + "\n");
         return 1;
@@ -332,4 +264,5 @@ int main(int argc, char* argv[])
 {
     return run(argc > 1 ? argv[1] : "", argc > 1);
 }
+#endif
 #endif
