@@ -75,3 +75,7 @@ cmake --build build-x86 --config Release --target csv_curve
 ```
 
 构建产物位于 `build-x86/Release/csv_curve.exe`。构建 64 位版时使用 `-A x64`，并另选构建目录。
+
+## 开源许可证
+
+本项目采用 [MIT 许可证](./LICENSE)。
