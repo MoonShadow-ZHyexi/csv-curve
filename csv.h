@@ -5,13 +5,15 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace csv {
 // Read one CSV record, preserving commas and newlines inside quoted fields.
-inline bool read_record(std::streambuf& input, std::vector<std::string>& fields)
+template<class Input>
+bool read_record(Input& input, std::vector<std::string>& fields)
 {
     using Traits = std::char_traits<char>;
     std::size_t column = 0;

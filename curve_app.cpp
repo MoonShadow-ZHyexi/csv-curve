@@ -1,5 +1,6 @@
 #include "curve_chart.h"
 #include "pwm_data.h"
+#include "resource.h"
 
 #include <commctrl.h>
 #include <commdlg.h>
@@ -26,10 +27,21 @@ using std::filesystem::path;
 constexpr UINT work_done = WM_APP + 1;
 constexpr UINT_PTR progress_timer = 1;
 constexpr UINT_PTR frame_timer = 2;
+constexpr UINT_PTR generation_timer = 3;
+constexpr UINT generation_delay = 280;
 constexpr int inset = 14;
 constexpr int chart_top = 170;
 constexpr int status_height = 37;
 constexpr wchar_t class_name[] = L"PwmCsvCurveWindow";
+
+int system_dpi()
+{
+    const HDC screen = GetDC(nullptr);
+    if (!screen) return 96;
+    const int dpi = GetDeviceCaps(screen, LOGPIXELSX);
+    ReleaseDC(nullptr, screen);
+    return dpi > 0 ? dpi : 96;
+}
 
 enum ControlId {
     open_csv = 100, save_image, zoom_in, zoom_out, reset_view, pwm_precision, save_converted,
@@ -85,8 +97,20 @@ struct CursorReadout {
     std::wstring y;
 };
 
+struct PlotInput {
+    const Column* x = nullptr;
+    const Column* y = nullptr;
+    std::optional<PwmOptions> pwm;
+
+    bool operator==(const PlotInput& other) const
+    {
+        return x == other.x && y == other.y && pwm == other.pwm;
+    }
+};
+
 struct GeneratedChart {
-    std::optional<PwmSeries> pwm;
+    PlotInput input;
+    std::shared_ptr<const PwmSeries> pwm;
     Plot plot;
 };
 
@@ -292,7 +316,10 @@ private:
     bool frame_pending_ = false;
     bool settings_dirty_ = false;
     bool pwm_display_units_active_ = false;
-    bool choosing_csv_output_ = false;
+    bool choosing_file_ = false;
+    bool combo_dropped_ = false;
+    bool automatic_generation_ = false;
+    std::optional<ULONGLONG> generation_due_;
     bool panning_ = false;
     Gdiplus::PointF pan_anchor_;
     View pan_start_;
@@ -340,19 +367,19 @@ private:
     AxisStyle style_for(const AxisControls& controls, const Column* column) const;
     bool pwm_mode() const { return selection(mode_) == 1; }
     bool can_navigate() const;
-    void settings_changed();
+    void settings_changed(bool regenerate);
+    void resume_updates();
+    std::wstring choose_file(Dialog kind, const std::wstring& suggested = {});
     void report_progress();
     template<class Job> bool start_work(Work kind, Job job);
-    void generate();
+    void generate(bool automatic = false);
     void export_csv();
-    void export_image() const;
+    void export_image();
 };
 
 void Window::initialize()
 {
-    const HDC dc = GetDC(handle);
-    scale_ = static_cast<float>(GetDeviceCaps(dc, LOGPIXELSX)) / 96.0f;
-    ReleaseDC(handle, dc);
+    scale_ = static_cast<float>(system_dpi()) / 96.0f;
     font_ = CreateFontW(-px(14), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                         CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
@@ -702,7 +729,7 @@ void Window::paint()
         SetTextColor(dc, RGB(83, 105, 122));
         const wchar_t* hint = work_ == Work::generating ? L"正在生成曲线…" :
                               work_ == Work::loading ? L"正在读取 CSV…" :
-                              table_.rows ? L"选择数据模式和列后，点击「生成曲线」" :
+                              table_.rows ? L"修改选项后自动生成，也可点击「生成曲线」" :
                                             L"拖入 CSV 文件，或点击「打开 CSV」";
         DrawTextW(dc, hint, -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         SelectObject(dc, previous);
@@ -732,7 +759,9 @@ void Window::update_status() const
             status += L"   ·   合并 " + formatted_count(pwm.repaired) + L" 对短脉冲";
         }
     }
-    if (settings_dirty_ || !chart_) {
+    if (generation_due_) {
+        status += L"   ·   等待更新曲线…";
+    } else if (settings_dirty_ || !chart_) {
         status += L"   ·   点击「生成曲线」应用设置";
     } else {
         status += L"   ·   滚轮缩放，拖动后松开平移";
@@ -743,7 +772,7 @@ void Window::update_status() const
 void Window::enable_controls() const
 {
     const bool idle = work_ == Work::none;
-    const bool editable = table_.rows && (idle || work_ == Work::rendering);
+    const bool editable = table_.rows && (idle || work_ == Work::rendering || work_ == Work::generating);
     const bool pwm = pwm_mode();
     const auto* signal = column_for(y_);
     const bool uses_threshold = pwm && signal && !duty_column(*signal);
@@ -871,7 +900,7 @@ AxisStyle Window::style_for(const AxisControls& controls, const Column* column) 
     return {std::move(name), unit.factor, decimals, std::move(coordinate_unit)};
 }
 
-void Window::settings_changed()
+void Window::settings_changed(bool regenerate)
 {
     settings_dirty_ = true;
     const bool pwm = pwm_mode();
@@ -879,8 +908,36 @@ void Window::settings_changed()
     SetWindowTextW(x_.label, pwm ? L"时间列" : L"X 轴列");
     SetWindowTextW(y_.label, pwm ? L"信号列" : L"Y 轴列");
     SetWindowTextW(x_.unit_label, pwm ? L"显示单位" : L"单位换算");
+    if (regenerate && table_.rows) {
+        generation_due_ = GetTickCount64() + generation_delay;
+        if (work_ == Work::generating || work_ == Work::rendering) {
+            cancel_.store(true, std::memory_order_relaxed);
+        }
+        resume_updates();
+    }
     update_status();
     enable_controls();
+}
+
+void Window::resume_updates()
+{
+    if (work_ != Work::none || choosing_file_ || combo_dropped_ || panning_) return;
+    if (generation_due_) {
+        const auto now = GetTickCount64();
+        const auto delay = *generation_due_ > now ? static_cast<UINT>(*generation_due_ - now) : 1;
+        SetTimer(handle, generation_timer, delay, nullptr);
+    } else if (frame_pending_) {
+        request_frame(70);
+    }
+}
+
+std::wstring Window::choose_file(Dialog kind, const std::wstring& suggested)
+{
+    choosing_file_ = true;
+    auto filename = file_dialog(handle, kind, suggested);
+    choosing_file_ = false;
+    resume_updates();
+    return filename;
 }
 
 template<class Job>
@@ -912,7 +969,7 @@ bool Window::start_work(Work kind, Job job)
 
 void Window::load(const path& filename)
 {
-    if (work_ != Work::none || choosing_csv_output_) return;
+    if (work_ != Work::none || choosing_file_) return;
     work_path_ = filename;
     progress_.store(0, std::memory_order_relaxed);
     if (start_work(Work::loading, [this, filename] {
@@ -924,9 +981,11 @@ void Window::load(const path& filename)
     }
 }
 
-void Window::generate()
+void Window::generate(bool automatic)
 {
     if (work_ != Work::none || !table_.rows) return;
+    generation_due_.reset();
+    KillTimer(handle, generation_timer);
     const auto* x = column_for(x_);
     const auto* y = column_for(y_);
     if (!x || !y) return;
@@ -946,8 +1005,11 @@ void Window::generate()
                 while (std::iswspace(*end)) ++end;
             }
             if (end == start || *end || !std::isfinite(value)) {
-                MessageBoxW(handle, L"请输入数字电平阈值，或留空使用自动阈值。", L"PWM 转换",
-                            MB_OK | MB_ICONINFORMATION);
+                set_status(L"请输入数字电平阈值，或留空使用自动阈值。");
+                if (!automatic) {
+                    MessageBoxW(handle, L"请输入数字电平阈值，或留空使用自动阈值。", L"PWM 转换",
+                                MB_OK | MB_ICONINFORMATION);
+                }
                 return;
             }
             options.threshold = value;
@@ -955,27 +1017,35 @@ void Window::generate()
     }
     const auto x_style = style_for(x_, x);
     const auto y_style = style_for(y_, y);
+    const PlotInput input{x, y, pwm ? std::optional<PwmOptions>(options) : std::nullopt};
+    const auto previous = chart_ && chart_->input == input ? chart_ : nullptr;
     const auto size = frame_size();
     pending_frame_ = size;
     const auto title = chart_title();
     frame_pending_ = false;
     KillTimer(handle, frame_timer);
-    if (start_work(Work::generating, [this, x, y, pwm, options, x_style, y_style, size, title] {
-        auto next = std::make_shared<GeneratedChart>();
-        next->plot = {x, y, x_style, y_style, {}, 0};
-        if (pwm) {
-            next->pwm = pwm_series(*x, *y, options, cancel_);
-            next->plot.x = &next->pwm->time;
-            next->plot.y = &next->pwm->duty;
-            next->plot.y_style = {next->pwm->duty.name, 1.0, y_style.decimals, L"%"};
+    automatic_generation_ = automatic;
+    if (start_work(Work::generating, [this, input, previous, x_style, y_style, size, title] {
+        auto next = previous ? std::make_shared<GeneratedChart>(*previous) : std::make_shared<GeneratedChart>();
+        if (!previous) {
+            next->input = input;
+            next->plot.x = input.x;
+            next->plot.y = input.y;
+            if (input.pwm) {
+                next->pwm = std::make_shared<PwmSeries>(pwm_series(*input.x, *input.y, *input.pwm, cancel_));
+                next->plot.x = &next->pwm->time;
+                next->plot.y = &next->pwm->duty;
+            }
+            fit_chart(next->plot, input.pwm.has_value(), cancel_);
         }
-        fit_chart(next->plot, pwm, cancel_);
+        next->plot.x_style = x_style;
+        next->plot.y_style = next->pwm ? AxisStyle{next->pwm->duty.name, 1.0, y_style.decimals, L"%"} : y_style;
         if (!cancel_.load(std::memory_order_relaxed)) {
-            pending_image_ = render_chart(size.width, size.height, size.scale, next->plot, title);
+            pending_image_ = render_chart(size.width, size.height, size.scale, next->plot, title, &cancel_);
             pending_chart_ = std::move(next);
         }
     })) {
-        set_status(pwm ? L"正在转换 PWM 并生成曲线…" : L"正在生成曲线…");
+        set_status(pwm && !previous ? L"正在转换 PWM 并生成曲线…" : L"正在生成曲线…");
         repaint_chart();
     }
 }
@@ -997,23 +1067,38 @@ void Window::finish_work()
     KillTimer(handle, progress_timer);
     const Work done = work_;
     work_ = Work::none;
-    if (!error_.empty()) {
+    const bool superseded = generation_due_ && (done == Work::generating || done == Work::rendering);
+    if (superseded) {
+        pending_chart_.reset();
+        pending_image_.reset();
+        error_.clear();
         update_status();
+    } else if (!error_.empty()) {
+        const bool automatic_error = done == Work::generating && automatic_generation_;
+        if (automatic_error) {
+            set_status(L"生成曲线失败   ·   " + error_);
+        } else {
+            update_status();
+        }
         enable_controls();
         repaint_chart();
-        MessageBoxW(handle, error_.c_str(), L"数据曲线", MB_OK | MB_ICONERROR);
+        if (!automatic_error) {
+            MessageBoxW(handle, error_.c_str(), L"数据曲线", MB_OK | MB_ICONERROR);
+        }
+        resume_updates();
         return;
-    }
-    if (done == Work::loading) {
+    } else if (done == Work::loading) {
         chart_.reset();
         image_.reset();
         clear_display_cache();
         refresh_readout();
         frame_pending_ = false;
         KillTimer(handle, frame_timer);
+        generation_due_.reset();
+        KillTimer(handle, generation_timer);
         table_ = std::move(pending_table_);
         fill_axis_choices();
-        settings_changed();
+        settings_changed(false);
         repaint_chart();
     } else if (done == Work::generating) {
         chart_ = std::move(pending_chart_);
@@ -1030,10 +1115,8 @@ void Window::finish_work()
     } else if (done == Work::saving) {
         set_status(L"已保存转换后的 CSV");
     }
-    if (frame_pending_ && !panning_) {
-        request_frame(70);
-    }
     enable_controls();
+    resume_updates();
 }
 
 bool Window::can_navigate() const
@@ -1051,7 +1134,7 @@ void Window::request_frame(UINT delay)
 
 void Window::render_view()
 {
-    if (!chart_ || !frame_pending_ || panning_ || choosing_csv_output_ ||
+    if (!chart_ || !frame_pending_ || generation_due_ || panning_ || choosing_file_ ||
         work_ != Work::none || IsIconic(handle)) return;
     Plot plot = chart_->plot;
     plot.view = requested_;
@@ -1061,7 +1144,7 @@ void Window::render_view()
     pending_view_ = plot.view;
     frame_pending_ = false;
     start_work(Work::rendering, [this, plot, size, title] {
-        pending_image_ = render_chart(size.width, size.height, size.scale, plot, title);
+        pending_image_ = render_chart(size.width, size.height, size.scale, plot, title, &cancel_);
     });
 }
 
@@ -1072,6 +1155,13 @@ void Window::timer(UINT_PTR id)
     } else if (id == frame_timer) {
         KillTimer(handle, frame_timer);
         render_view();
+    } else if (id == generation_timer) {
+        KillTimer(handle, generation_timer);
+        if (!generation_due_ || work_ != Work::none || choosing_file_ || combo_dropped_ || panning_) return;
+        if (*generation_due_ <= GetTickCount64()) {
+            generate(true);
+        }
+        resume_updates();
     }
 }
 
@@ -1079,10 +1169,7 @@ void Window::export_csv()
 {
     if (!chart_ || !chart_->pwm || work_ != Work::none) return;
     const auto current = chart_;
-    choosing_csv_output_ = true;
-    const auto filename = file_dialog(handle, Dialog::save_csv, table_.path.stem().wstring() + L"_v0.csv");
-    choosing_csv_output_ = false;
-    if (frame_pending_) request_frame(70);
+    const auto filename = choose_file(Dialog::save_csv, table_.path.stem().wstring() + L"_v0.csv");
     if (filename.empty()) return;
     std::error_code error;
     if (std::filesystem::equivalent(filename, table_.path, error) ||
@@ -1095,11 +1182,11 @@ void Window::export_csv()
     }
 }
 
-void Window::export_image() const
+void Window::export_image()
 {
     const auto image = image_;
     if (!image) return;
-    const auto filename = file_dialog(handle, Dialog::jpeg, table_.path.stem().wstring() + L".jpg");
+    const auto filename = choose_file(Dialog::jpeg, table_.path.stem().wstring() + L".jpg");
     if (filename.empty()) {
         return;
     }
@@ -1119,7 +1206,16 @@ void Window::export_image() const
 void Window::command(int id, int notification)
 {
     if (id == pwm_threshold && notification == EN_CHANGE) {
-        settings_changed();
+        if (IsWindowEnabled(threshold_) && GetFocus() == threshold_) settings_changed(true);
+        return;
+    }
+    if (notification == CBN_DROPDOWN) {
+        combo_dropped_ = true;
+        return;
+    }
+    if (notification == CBN_CLOSEUP) {
+        combo_dropped_ = false;
+        resume_updates();
         return;
     }
     if (notification == CBN_SELCHANGE) {
@@ -1135,7 +1231,7 @@ void Window::command(int id, int notification)
         if (id == data_mode || id == x_column || id == y_column || id == x_unit || id == y_unit ||
             id == x_decimals || id == y_decimals || id == pwm_polarity ||
             id == pwm_precision || id == pwm_time_unit) {
-            settings_changed();
+            settings_changed(true);
         }
         return;
     }
@@ -1144,7 +1240,7 @@ void Window::command(int id, int notification)
     }
     switch (id) {
     case open_csv: {
-        const auto filename = file_dialog(handle, Dialog::open_csv);
+        const auto filename = choose_file(Dialog::open_csv);
         if (!filename.empty()) {
             load(filename);
         }
@@ -1256,6 +1352,7 @@ void Window::end_pan()
     }
     refresh_readout();
     request_frame(50);
+    resume_updates();
 }
 
 void Window::close()
@@ -1323,15 +1420,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
     }
     int result = 1;
     {
-        WNDCLASSW type = {};
+        WNDCLASSEXW type = {};
+        type.cbSize = sizeof(type);
         type.lpfnWndProc = window_proc;
         type.hInstance = instance;
         type.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        type.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+        type.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_CSV_CURVE));
+        type.hIconSm = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(IDI_CSV_CURVE), IMAGE_ICON,
+                                                   GetSystemMetrics(SM_CXSMICON),
+                                                   GetSystemMetrics(SM_CYSMICON), LR_SHARED));
         type.lpszClassName = class_name;
         Window window;
-        if (RegisterClassW(&type)) {
-            const int dpi = static_cast<int>(GetDpiForSystem());
+        if (RegisterClassExW(&type)) {
+            const int dpi = system_dpi();
             const int width = std::min(MulDiv(1080, dpi, 96), GetSystemMetrics(SM_CXSCREEN));
             const int height = std::min(MulDiv(760, dpi, 96), GetSystemMetrics(SM_CYSCREEN));
             HWND hwnd = CreateWindowExW(0, class_name, L"CSV 数据曲线",

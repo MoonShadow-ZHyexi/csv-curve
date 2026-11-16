@@ -103,7 +103,7 @@ struct Bucket {
     std::size_t high_y = 0;
 };
 
-void draw_curve(Graphics& canvas, const RectF& area, const Plot& plot)
+void draw_curve(Graphics& canvas, const RectF& area, const Plot& plot, const std::atomic_bool* cancel)
 {
     const auto& x = plot.x->values;
     const auto& y = plot.y->values;
@@ -162,6 +162,10 @@ void draw_curve(Graphics& canvas, const RectF& area, const Plot& plot)
     canvas.SetClip(area);
     canvas.SetSmoothingMode(SmoothingModeAntiAlias);
     for (std::size_t i = first; i < last; ++i) {
+        if (i % 4096 == 0 && cancel && cancel->load(std::memory_order_relaxed)) {
+            canvas.Restore(saved);
+            return;
+        }
         if (!valid_point(x[i], y[i])) {
             flush_bucket();
             flush_line();
@@ -187,7 +191,7 @@ void draw_curve(Graphics& canvas, const RectF& area, const Plot& plot)
     canvas.Restore(saved);
 }
 void draw_chart(Graphics& canvas, float width, float height, const Plot& plot,
-                const std::wstring& filename)
+                const std::wstring& filename, const std::atomic_bool* cancel)
 {
     canvas.Clear(paper);
     canvas.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
@@ -223,7 +227,7 @@ void draw_chart(Graphics& canvas, float width, float height, const Plot& plot,
     canvas.DrawLine(&axes, area.X, area.Y, area.X, bottom);
     canvas.DrawLine(&axes, area.X, bottom, area.GetRight(), bottom);
     if (plot.point_count > 0) {
-        draw_curve(canvas, area, plot);
+        draw_curve(canvas, area, plot, cancel);
     } else {
         text(canvas, L"所选列没有可绘制的第一象限数据", axis, muted, area, StringAlignmentCenter);
     }
@@ -255,7 +259,8 @@ std::wstring coordinate_label(const Range& range, const AxisStyle& style, double
 }
 
 std::shared_ptr<Gdiplus::Bitmap> render_chart(int width, int height, float scale, const Plot& plot,
-                                              const std::wstring& filename)
+                                              const std::wstring& filename,
+                                              const std::atomic_bool* cancel)
 {
     auto bitmap = std::shared_ptr<Bitmap>(new Bitmap(width, height, PixelFormat24bppRGB));
     if (bitmap->GetLastStatus() != Ok) {
@@ -264,7 +269,7 @@ std::shared_ptr<Gdiplus::Bitmap> render_chart(int width, int height, float scale
     Graphics canvas(bitmap.get());
     canvas.ScaleTransform(scale, scale);
     draw_chart(canvas, static_cast<float>(width) / scale, static_cast<float>(height) / scale,
-               plot, filename);
+               plot, filename, cancel);
     return bitmap;
 }
 

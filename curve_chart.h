@@ -38,5 +38,6 @@ Gdiplus::RectF plot_area(float width, float height);
 std::wstring coordinate_label(const Range& range, const AxisStyle& style, double fraction,
                               double pixels);
 std::shared_ptr<Gdiplus::Bitmap> render_chart(int width, int height, float scale, const Plot& plot,
-                                              const std::wstring& filename);
+                                              const std::wstring& filename,
+                                              const std::atomic_bool* cancel = nullptr);
 bool save_jpeg(const std::filesystem::path& path, Gdiplus::Bitmap& bitmap);

@@ -3,7 +3,9 @@
 
 #include <windows.h>
 
+#include <array>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 
@@ -29,7 +31,132 @@ std::wstring wide_text(std::string_view text)
 }
 
 namespace {
-double plot_value(std::string& field, bool& percent)
+class BufferedInput {
+public:
+    explicit BufferedInput(std::istream& input) : input_(input) {}
+
+    const char* current() const { return next_; }
+    const char* end() const { return end_; }
+    void advance(const char* next) { next_ = next; }
+
+    int sgetc()
+    {
+        if (next_ == end_) {
+            input_.read(buffer_.data(), static_cast<std::streamsize>(buffer_.size()));
+            if (input_.bad()) {
+                throw std::runtime_error("读取 CSV 文件失败。");
+            }
+            next_ = buffer_.data();
+            end_ = next_ + input_.gcount();
+            if (next_ == end_) return std::char_traits<char>::eof();
+        }
+        return std::char_traits<char>::to_int_type(*next_);
+    }
+
+    int sbumpc()
+    {
+        const auto value = sgetc();
+        if (value != std::char_traits<char>::eof()) ++next_;
+        return value;
+    }
+
+private:
+    std::istream& input_;
+    std::array<char, 256 * 1024> buffer_;
+    const char* next_ = buffer_.data();
+    const char* end_ = next_;
+};
+
+class CsvRecords {
+public:
+    explicit CsvRecords(std::istream& input) : input_(input) {}
+
+    bool read(std::vector<std::string_view>& fields)
+    {
+        using Traits = std::char_traits<char>;
+        while (input_.sgetc() != Traits::eof()) {
+            if (skip_lf_) {
+                skip_lf_ = false;
+                if (input_.sgetc() == '\n') input_.sbumpc();
+            }
+            fields.clear();
+            // Keep unquoted fields as views into the buffer. The general CSV
+            // parser handles quoted records and records that cross a refill.
+            const auto simple = read_unquoted(fields);
+            if (simple == Record::fields) return true;
+            if (simple == Record::blank) continue;
+
+            if (!csv::read_record(input_, owned_fields_)) return false;
+            fields.assign(owned_fields_.begin(), owned_fields_.end());
+            return true;
+        }
+        return false;
+    }
+
+private:
+    enum class Record { fields, blank, fallback };
+
+    Record read_unquoted(std::vector<std::string_view>& fields)
+    {
+        const char* start = input_.current();
+        bool blank = true;
+        for (const char* next = start; next != input_.end(); ++next) {
+            const char ch = *next;
+            if (ch == ',') {
+                fields.emplace_back(start, static_cast<std::size_t>(next - start));
+                start = next + 1;
+                blank = false;
+            } else if (ch == '\n' || ch == '\r') {
+                input_.advance(next + 1);
+                // Delay the LF check so the caller's views survive a refill.
+                skip_lf_ = ch == '\r';
+                if (blank) return Record::blank;
+                fields.emplace_back(start, static_cast<std::size_t>(next - start));
+                return Record::fields;
+            } else if (ch == '"') {
+                break;
+            } else if (blank && ch != ' ' && ch != '\t') {
+                blank = false;
+            }
+        }
+        return Record::fallback;
+    }
+
+    BufferedInput input_;
+    std::vector<std::string> owned_fields_;
+    bool skip_lf_ = false;
+};
+
+bool plain_decimal(std::string_view text, double& result)
+{
+    if (text.empty() || text.size() > 17) return false;
+    const bool negative = text.front() == '-';
+    if (negative || text.front() == '+') text.remove_prefix(1);
+    std::uint64_t digits = 0;
+    int count = 0;
+    int fraction = -1;
+    for (const char ch : text) {
+        if (ch >= '0' && ch <= '9') {
+            if (++count > 15) return false;
+            digits = digits * 10 + static_cast<unsigned>(ch - '0');
+            if (fraction >= 0) ++fraction;
+        } else if (ch == '.' && fraction < 0) {
+            fraction = 0;
+        } else {
+            return false;
+        }
+    }
+    if (count == 0) return false;
+    // Both operands are exact doubles for up to 15 decimal digits.
+    constexpr double powers[] = {1.0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7,
+                                 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15};
+    const double value = static_cast<double>(digits);
+    const double magnitude = fraction > 0 ? value / powers[fraction] : value;
+    result = negative ? -magnitude : magnitude;
+    return true;
+}
+
+double plot_value(std::string_view field, bool& percent)
 {
     constexpr double missing = std::numeric_limits<double>::quiet_NaN();
     if (field.empty()) {
@@ -37,11 +164,9 @@ double plot_value(std::string& field, bool& percent)
     }
     const auto last = field.find_last_not_of(" \t\r\n");
     const bool has_percent = last != std::string::npos && field[last] == '%';
-    if (has_percent) {
-        field.resize(last);
-    }
+    const auto text = has_percent ? field.substr(0, last) : field;
     double value = 0.0;
-    if (csv::parse_number(field, value) && std::isfinite(value)) {
+    if ((plain_decimal(text, value) || csv::parse_number(std::string(text), value)) && std::isfinite(value)) {
         percent = percent || has_percent;
         return value;
     }
@@ -49,7 +174,7 @@ double plot_value(std::string& field, bool& percent)
     if (has_percent || first == std::string::npos) {
         return missing;
     }
-    const std::string_view token(field.data() + first, last - first + 1);
+    const auto token = field.substr(first, last - first + 1);
     if (token == "HIGH" || token == "High" || token == "high") return 1.0;
     if (token == "LOW" || token == "Low" || token == "low") return 0.0;
     return missing;
@@ -64,8 +189,9 @@ CsvTable load_table(const std::filesystem::path& path, const std::atomic_bool& c
         throw std::runtime_error("无法打开 CSV 文件。");
     }
     csv::skip_bom(input);
-    std::vector<std::string> fields;
-    if (!csv::read_record(*input.rdbuf(), fields)) {
+    CsvRecords records(input);
+    std::vector<std::string_view> fields;
+    if (!records.read(fields)) {
         throw std::runtime_error("CSV 为空，第一行应为列名。");
     }
 
@@ -80,7 +206,7 @@ CsvTable load_table(const std::filesystem::path& path, const std::atomic_bool& c
         table.columns.push_back({std::move(name), {}, true});
     }
 
-    while (csv::read_record(*input.rdbuf(), fields)) {
+    while (records.read(fields)) {
         if (table.rows % 4096 == 0) {
             if (cancel.load(std::memory_order_relaxed)) {
                 return {};

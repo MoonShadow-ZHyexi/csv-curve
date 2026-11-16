@@ -9,6 +9,12 @@ struct PwmOptions {
     int time_decimals = 1;
     bool active_high = true;
     std::optional<double> threshold = std::nullopt;
+
+    bool operator==(const PwmOptions& other) const
+    {
+        return seconds_per_unit == other.seconds_per_unit && time_decimals == other.time_decimals &&
+               active_high == other.active_high && threshold == other.threshold;
+    }
 };
 
 struct PwmSeries {

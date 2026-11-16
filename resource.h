@@ -1,0 +1,6 @@
+#ifndef CSV_CURVE_RESOURCE_H
+#define CSV_CURVE_RESOURCE_H
+
+#define IDI_CSV_CURVE 101
+
+#endif
